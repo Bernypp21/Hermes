@@ -163,6 +163,180 @@ The server will connect to MongoDB and begin listening on port `3000` (or the va
 
 ---
 
+## Testing
+
+Tests are written with **Jest** and **Supertest**. All database and socket dependencies are mocked — no live MongoDB connection or running server is needed to run the tests.
+
+### How to run
+
+```bash
+cd backend/Server
+npm test
+```
+
+Expected output:
+```
+Test Suites: 5 passed, 5 total
+Tests:       73 passed, 73 total
+```
+
+### How it works
+
+- **Models are mocked** — `userModel` and `messageModel` are replaced with `jest.fn()` stubs so tests never touch MongoDB.
+- **JWT is real** — tokens are signed and verified against a fixed test secret (`test-secret-key`) set in `__tests__/setup.js`.
+- **Socket tests use a real in-process server** — an HTTP server is started on a random port; `socket.io-client` connects to it so event handling is tested end-to-end without a separately running process.
+- **Supertest** mounts the actual Express app, so middleware chains (including `verifyToken`) run exactly as they do in production.
+
+---
+
+### `__tests__/setup.js`
+Runs before every test suite. Sets `process.env.JWT_SECRET = 'test-secret-key'` and `NODE_ENV = 'test'` so token signing and verification work consistently without a `.env` file.
+
+---
+
+### `__tests__/auth.test.js` — 26 tests
+Tests the full auth lifecycle via Supertest against a minimal Express app with `userModel` mocked.
+
+**POST `/api/auth/signup`** (9 tests)
+| Scenario | Expected |
+|---|---|
+| Valid email + password | 201, user in body, `set-cookie` header present |
+| Missing email | 400 |
+| Missing password | 400 |
+| Invalid email format | 400 |
+| Password shorter than 8 chars | 400 |
+| Non-string email (integer) | 400 |
+| NoSQL injection attempt in email field | 400 |
+| Email already in use | 409 |
+| DB throws during `create` | 500 |
+
+**POST `/api/auth/login`** (8 tests)
+| Scenario | Expected |
+|---|---|
+| Valid credentials | 200, user in body |
+| Missing email | 400 |
+| Missing password | 400 |
+| Invalid email format | 400 |
+| Wrong password | 400 |
+| Injection attempt in email field | 400 |
+| User not found in DB | 404 |
+| DB disconnects during `findOne` | 500 |
+
+**POST `/api/auth/logout`** (1 test)
+| Scenario | Expected |
+|---|---|
+| Any request | 200, clears JWT cookie, `"Logged out successfully"` message |
+
+**GET `/api/auth/userinfo`** (5 tests)
+| Scenario | Expected |
+|---|---|
+| No token | 401 |
+| Malformed token | 401 |
+| Valid token, user exists | 200, full user object |
+| Valid token, user deleted from DB | 404 |
+| Valid token, DB timeout | 500 |
+
+**POST `/api/auth/update-profile`** (8 tests — requires valid token for all non-401 cases)
+| Scenario | Expected |
+|---|---|
+| No token | 401 |
+| Valid `firstName`, `lastName`, `color` | 200, updated user in body |
+| Valid `firstName` and `lastName` (color omitted) | 200 |
+| Missing `firstName` | 400 |
+| Missing `lastName` | 400 |
+| Empty strings for both fields | 400 |
+| XSS injection attempt in name fields | 400 |
+| DB write error | 500 |
+
+---
+
+### `__tests__/contact.test.js` — 19 tests
+Tests contact search and DM management via Supertest with `userModel` and `messageModel` mocked.
+
+**POST `/api/contacts/search`** (7 tests)
+| Scenario | Expected |
+|---|---|
+| Valid `searchTerm` with results | 200, matching contacts array |
+| Valid `searchTerm`, no match | 200, empty array |
+| Missing `searchTerm` | 400 |
+| Empty string `searchTerm` | 400 |
+| Regex injection in `searchTerm` (e.g. `.*`) | 200 — controller escapes the regex, returns empty safely |
+| No token | 401 |
+| DB error during search | 500 |
+
+**GET `/api/contacts/all-contacts`** (5 tests)
+| Scenario | Expected |
+|---|---|
+| Other users exist | 200, `{ label: "First Last", value: id }` format |
+| No other users in DB | 200, empty array |
+| User with no name → label `"No Name"` | 200 |
+| No token | 401 |
+| DB error | 500 |
+
+**GET `/api/contacts/get-contacts-for-list`** (4 tests)
+| Scenario | Expected |
+|---|---|
+| User has message history | 200, contacts sorted by latest message |
+| No message history | 200, empty array |
+| No token | 401 |
+| DB aggregation failure | 500 |
+
+**DELETE `/api/contacts/delete-dm/:dmId`** (5 tests)
+| Scenario | Expected |
+|---|---|
+| Valid `dmId`, messages deleted | 200, `"DM deleted successfully"` |
+| Valid `dmId`, nothing to delete | 200 |
+| Malformed `dmId` | 400 |
+| No token | 401 |
+| DB write error | 500 |
+
+---
+
+### `__tests__/message.test.js` — 8 tests
+Tests `getMessages` via Supertest with `messageModel` mocked. The `find()` mock must replicate the full `find().sort().populate().populate()` chain used in the controller.
+
+| Scenario | Expected |
+|---|---|
+| Valid user + contact IDs, messages exist | 200, array with populated message objects |
+| Valid IDs, no messages between users | 200, empty array |
+| Missing contact ID in body | 400 |
+| Invalid ObjectId format for contact ID | 400 |
+| Integer ID (`mongoose.isValid` returns `true` for integers) | 200 — noted as a known edge case |
+| No token | 401 |
+| Malformed token | 401 |
+| DB query timeout | 500 |
+
+---
+
+### `__tests__/verifyToken.test.js` — 5 tests
+Unit tests the middleware directly — no HTTP layer. Calls `verifyToken(req, res, next)` with hand-crafted mock objects.
+
+| Scenario | Expected |
+|---|---|
+| Cookie absent (undefined) | 401, `"No token"` message, `next` not called |
+| Malformed token string | 401, `next` not called |
+| Expired token (`expiresIn: '-1s'`) | 401, `next` not called |
+| Token signed with wrong secret | 401, `next` not called |
+| Valid token | `next()` called, `req.userId` set to the decoded ID |
+
+---
+
+### `__tests__/socket.test.js` — 9 tests
+Integration tests for `socketManager.js`. A real HTTP server is started on a random port (`httpServer.listen(0)`); `socket.io-client` connects to it so the full Socket.IO event pipeline runs. `messageModel.create` and `messageModel.findById` are mocked.
+
+| Scenario | Expected |
+|---|---|
+| Client connects with a `userId` | `client.connected === true`, userId registered in socket map |
+| Client connects without a `userId` (anonymous) | `client.connected === true` |
+| `sendMessage` with missing `recipient` and `content` | Server emits `error` event with `/required/i` message |
+| `sendMessage` with missing `content` | Server emits `error` event with `/required/i` message |
+| Valid `sendMessage`, recipient offline | `receiveMessage` emitted to sender; message saved to DB |
+| Valid `sendMessage`, both clients connected | `receiveMessage` emitted to both sender and recipient |
+| Valid `sendMessage`, recipient offline (DB persistence check) | `messageModel.create` called with correct payload |
+| Client disconnects | `client.connected === false`, userId removed from socket map |
+
+---
+
 ## Connecting the Frontend
 
 The frontend (provided by TA) must be configured to point to the backend server. Below are the required settings.

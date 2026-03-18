@@ -29,3 +29,7 @@ coverage
 
 # Ignore the report meant for the professor/grader
 report.md
+*.pdf
+
+# Ignore test files
+*.config.cjs
